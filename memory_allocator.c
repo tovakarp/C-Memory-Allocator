@@ -1,5 +1,4 @@
-#include <stddef.h>
-#include <stdio.h>
+#include <stdbool.h>
 #include "memory_allocator.h"
 
 #define OCCUPY_BLOCK 1
@@ -14,56 +13,130 @@ struct MemoryAllocator
 
 /* ----------------------- AUXILIARY FUNCTIONS ----------------------- */
 
-size_t getAlignedSize(size_t size)
+static size_t getAlignedSize(size_t size)
 {
 	return (size % ALIGN) ? size + ALIGN + (ALIGN - (size % ALIGN)) : size + ALIGN;
 }
 
-size_t getMemorySize(void* memory)
+
+static size_t getBlockSize(void* memory)
 {
 	return (memory) ? (*(size_t*)memory & FREE_BLOCK) : 0;
 }
 
-
-void* findFreeBlock(MemoryAllocator* allocator, void* block)
+static void* getMemory(MemoryAllocator* allocator)
 {
-	void* end = (char*)allocator->m_memory + allocator->m_size;
-	
-	while((block < end) && (*(size_t*)block & OCCUPY_BLOCK))
+	return allocator->m_memory;
+}
+
+static void* getEndOfMemory(MemoryAllocator* allocator)
+{
+	return (char*)getMemory(allocator) + allocator->m_size;
+}
+
+static void* getNextBlock(void* block)
+{
+	return (char*)block + getBlockSize(block);
+}
+
+static bool isBlockInMemory(MemoryAllocator* allocator, void* block)
+{
+	return block < getEndOfMemory(allocator);
+}
+
+static bool isBlockFree(void* block)
+{
+	return (*(size_t*)block | FREE_BLOCK) == FREE_BLOCK;
+}
+
+static bool isBlockOccupied(void* block)
+{
+	return !isBlockFree(block);
+}
+
+
+static void* findFreeBlock(MemoryAllocator* allocator, void* block)
+{	
+	while(isBlockInMemory(allocator, block) && isBlockOccupied(block))
 	{
-		block = (char*)block + getMemorySize(block);
-		
+		block = getNextBlock(block);	
 	}
 	
-	if (block >= end)
+	if (!isBlockInMemory(allocator, block))
 	{
 		return NULL;
 	}
-		
-		
+				
 	return block;
 }
 
 
-void splitMemory(void* memory, size_t size)
+static void splitMemory(void* memory, size_t size)
 {
-	*(size_t*)((char*)memory + size) = getMemorySize(memory) - size;	
+	*(size_t*)((char*)memory + size) = getBlockSize(memory) - size;	
 	*(size_t*)memory = size;
 }
 
-void occupyBlock(void *memory)
+static void occupyBlock(void *memory)
 {
 	*(size_t*)memory |= OCCUPY_BLOCK;
 }
 
-void freeBlock(void* memory)
+static void freeBlock(void* memory)
 {
 	*(size_t*)memory &= FREE_BLOCK;
 }
 
-void mergeBlocks(void *block)
+static void mergeBlocks(void *block)
 {
-	*(size_t*)block = getMemorySize(block) + getMemorySize((char*)block + *(size_t*)block);
+	*(size_t*)block = getBlockSize(block) + getBlockSize((char*)block + *(size_t*)block);
+}
+
+
+static void mergeAdjacentBlocks(MemoryAllocator* allocator, void* block, size_t* max)
+{
+	void* end = getEndOfMemory(allocator);
+	void* next = getNextBlock(block);
+	
+	while ( isBlockFree(block) && next <= end)
+	{
+		*max = *max > getBlockSize(block)? *max : getBlockSize(block);
+		if (isBlockOccupied(next)|| next == end)
+			break;
+
+		mergeBlocks(block);
+		next = getNextBlock(block);
+	}
+}
+
+static void* getBlockMetadata(void* block)
+{
+	return (char*)block - ALIGN;
+}
+
+
+static void mergeBlocksIfNeeded(MemoryAllocator *allocator, void* block, size_t size)
+{	
+	if (getBlockSize(block) < size)
+		{	
+			while (getBlockSize(block) < size && isBlockFree(getNextBlock(block)) && isBlockInMemory(allocator, getNextBlock(block)))
+			{
+				mergeBlocks(block);	
+			}
+		}
+}
+
+static bool occupuBlockAndSplitIfNeeded(void *block, size_t size)
+{
+	if(getBlockSize(block) >= size)
+	{
+		if (getBlockSize(block) > size)
+			splitMemory(block, size);
+			
+		occupyBlock(block);
+		return 1;
+	}
+	return 0;
 }
 
 /* ----------------------- API FUNCTIONS ----------------------- */
@@ -86,7 +159,7 @@ MemoryAllocator* MemoryAllocator_init(void* memoryPool, size_t size)
 
 void* MemoryAllocator_release(MemoryAllocator* allocator)
 {
-	void* mp_ptr = allocator->m_memory;
+	void* mp_ptr = getMemory(allocator);
 	free(allocator);
 	
 	return mp_ptr;
@@ -95,49 +168,27 @@ void* MemoryAllocator_release(MemoryAllocator* allocator)
 
 void* MemoryAllocator_allocate(MemoryAllocator* allocator, size_t size)
 {
-	void* block = allocator->m_memory;
-	void* end = (char*)allocator->m_memory + allocator->m_size;
-	void* next;
+	void* block = getMemory(allocator);
 	
 	size = getAlignedSize(size);
 	
-	
-	while(block < end)
+	while ( isBlockInMemory(allocator, block) )
 	{	
 		block = findFreeBlock(allocator, block);
 		
 		if (!block)
-		{
 			return NULL;
-		}
+
+		mergeBlocksIfNeeded(allocator, block, size);
 		
-		
-		if (*(size_t*)block < size)
-		{
-			next = (char*)block + getMemorySize(block);
-			while (*(size_t*)block < size && (*(size_t*)next | FREE_BLOCK) == FREE_BLOCK && next < end)
-			{
-				mergeBlocks(block);	
-				next = (char*)block + getMemorySize(block);
-			}
-		}
-		
-		if(*(size_t*)block >= size)
-		{
-			if (getMemorySize(block) > size)
-				splitMemory(block, size);
-				
-			occupyBlock(block);
+		if(occupuBlockAndSplitIfNeeded(block, size))
 			break;
-		}
 		
-		block = (char*)block + getMemorySize(block);
+		block = getNextBlock(block);
 	}
 	
-	if (block >= end)
-	{	
+	if (!isBlockInMemory(allocator, block))	
 		return NULL;
-	}
 			
 	return (char*)block + ALIGN;
 }
@@ -145,43 +196,27 @@ void* MemoryAllocator_allocate(MemoryAllocator* allocator, size_t size)
 
 void MemoryAllocator_free(MemoryAllocator* allocator, void* ptr)
 {
-	void* next, *end = (char*)allocator->m_memory + allocator->m_size;
-	ptr = (char*)ptr - ALIGN;
-	next = (char*)ptr + getMemorySize(ptr);
+	ptr = getBlockMetadata(ptr);
 	
 	freeBlock(ptr);
 
-	if (((*(size_t*)next | FREE_BLOCK) == FREE_BLOCK) && next < end)
+	if (isBlockFree(getNextBlock(ptr)) && isBlockInMemory(allocator, getNextBlock(ptr)))
 	{
 		mergeBlocks(ptr);
 	}
 }
 
+
 size_t MemoryAllocator_optimize(MemoryAllocator* allocator)
 {
 	size_t max = 0;
-	void *ptr = allocator->m_memory;
-	void *end = (char*)allocator->m_memory + allocator->m_size;
-	void *next; 
+	void *ptr = getMemory(allocator);
 	
-	while(ptr < end)
-	{
-		next = (char*)ptr + getMemorySize(ptr);
+	while(isBlockInMemory(allocator, ptr))
+	{	
+		mergeAdjacentBlocks(allocator, ptr, &max);
 		
-		while(((*(size_t*)ptr | FREE_BLOCK) == FREE_BLOCK) && next <= end)
-		{
-			max = max > getMemorySize(ptr)? max : getMemorySize(ptr);
-			if ((*(size_t*)next | FREE_BLOCK) != FREE_BLOCK || next == end)
-				break;
-				
-			if (((*(size_t*)next | FREE_BLOCK) == FREE_BLOCK))
-			{
-				mergeBlocks(ptr);
-				next = (char*)ptr + getMemorySize(ptr);
-			}	
-		}
-		
-		ptr = (char*)ptr + getMemorySize(ptr);
+		ptr = getNextBlock(ptr);
 	}
 	
 	return max;
